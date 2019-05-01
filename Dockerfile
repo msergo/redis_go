@@ -1,68 +1,64 @@
-FROM golang:alpine
-
-# add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
-RUN addgroup -S redis && adduser -S -G redis redis
-
+FROM redis:5.0.4-alpine3.9
 RUN apk add --no-cache \
-# grab su-exec for easy step-down from root
-		'su-exec>=0.2' \
-# add tzdata for https://github.com/docker-library/redis/issues/138
-		tzdata
+		ca-certificates
 
-ENV REDIS_VERSION 5.0.4
-ENV REDIS_DOWNLOAD_URL http://download.redis.io/releases/redis-5.0.4.tar.gz
-ENV REDIS_DOWNLOAD_SHA 3ce9ceff5a23f60913e1573f6dfcd4aa53b42d4a2789e28fa53ec2bd28c987dd
+# set up nsswitch.conf for Go's "netgo" implementation
+# - https://github.com/golang/go/blob/go1.9.1/src/net/conf.go#L194-L275
+# - docker run --rm debian:stretch grep '^hosts:' /etc/nsswitch.conf
+RUN [ ! -e /etc/nsswitch.conf ] && echo 'hosts: files dns' > /etc/nsswitch.conf
 
-# for redis-sentinel see: http://redis.io/topics/sentinel
-RUN set -ex; \
-	\
-	apk add --no-cache --virtual .build-deps libc6-compat \
-		coreutils \
+ENV GOLANG_VERSION 1.11.9
+
+RUN set -eux; \
+	apk add --no-cache --virtual .build-deps \
+		bash \
 		gcc \
-		linux-headers \
-		make \
 		musl-dev \
+		openssl \
+		go \
 	; \
+	export \
+# set GOROOT_BOOTSTRAP such that we can actually build Go
+		GOROOT_BOOTSTRAP="$(go env GOROOT)" \
+# ... and set "cross-building" related vars to the installed system's values so that we create a build targeting the proper arch
+# (for example, if our build host is GOARCH=amd64, but our build env/image is GOARCH=386, our build needs GOARCH=386)
+		GOOS="$(go env GOOS)" \
+		GOARCH="$(go env GOARCH)" \
+		GOHOSTOS="$(go env GOHOSTOS)" \
+		GOHOSTARCH="$(go env GOHOSTARCH)" \
+	; \
+# also explicitly set GO386 and GOARM if appropriate
+# https://github.com/docker-library/golang/issues/184
+	apkArch="$(apk --print-arch)"; \
+	case "$apkArch" in \
+		armhf) export GOARM='6' ;; \
+		x86) export GO386='387' ;; \
+	esac; \
 	\
-	wget -O redis.tar.gz "$REDIS_DOWNLOAD_URL"; \
-	echo "$REDIS_DOWNLOAD_SHA *redis.tar.gz" | sha256sum -c -; \
-	mkdir -p /usr/src/redis; \
-	tar -xzf redis.tar.gz -C /usr/src/redis --strip-components=1; \
-	rm redis.tar.gz; \
+	wget -O go.tgz "https://golang.org/dl/go$GOLANG_VERSION.src.tar.gz"; \
+	echo 'ee80684b352f8d6b49d804d4e615f015ae92da41c4096cfee89ed4783b2498e3 *go.tgz' | sha256sum -c -; \
+	tar -C /usr/local -xzf go.tgz; \
+	rm go.tgz; \
 	\
-# disable Redis protected mode [1] as it is unnecessary in context of Docker
-# (ports are not automatically exposed when running inside Docker, but rather explicitly by specifying -p / -P)
-# [1]: https://github.com/antirez/redis/commit/edd4d555df57dc84265fdfb4ef59a4678832f6da
-	grep -q '^#define CONFIG_DEFAULT_PROTECTED_MODE 1$' /usr/src/redis/src/server.h; \
-	sed -ri 's!^(#define CONFIG_DEFAULT_PROTECTED_MODE) 1$!\1 0!' /usr/src/redis/src/server.h; \
-	grep -q '^#define CONFIG_DEFAULT_PROTECTED_MODE 0$' /usr/src/redis/src/server.h; \
-# for future reference, we modify this directly in the source instead of just supplying a default configuration flag because apparently "if you specify any argument to redis-server, [it assumes] you are going to specify everything"
-# see also https://github.com/docker-library/redis/issues/4#issuecomment-50780840
-# (more exactly, this makes sure the default behavior of "save on SIGTERM" stays functional by default)
+	cd /usr/local/go/src; \
+	./make.bash; \
 	\
-	make -C /usr/src/redis -j "$(nproc)"; \
-	make -C /usr/src/redis install; \
-	\
-	rm -r /usr/src/redis; \
-	\
-	runDeps="$( \
-		scanelf --needed --nobanner --format '%n#p' --recursive /usr/local \
-			| tr ',' '\n' \
-			| sort -u \
-			| awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
-	)"; \
-	apk add --virtual .redis-rundeps $runDeps; \
+	rm -rf \
+# https://github.com/golang/go/blob/0b30cf534a03618162d3015c8705dd2231e34703/src/cmd/dist/buildtool.go#L121-L125
+		/usr/local/go/pkg/bootstrap \
+# https://golang.org/cl/82095
+# https://github.com/golang/build/blob/e3fe1605c30f6a3fd136b561569933312ede8782/cmd/release/releaselet.go#L56
+		/usr/local/go/pkg/obj \
+	; \
 	apk del .build-deps; \
 	\
-	redis-server --version
+	export PATH="/usr/local/go/bin:$PATH"; \
+	go version
 
-RUN mkdir /data && chown redis:redis /data
-VOLUME /data
-WORKDIR /data
+ENV GOPATH /go
+ENV PATH $GOPATH/bin:/usr/local/go/bin:$PATH
 
-COPY docker-entrypoint.sh /usr/local/bin/
-ENTRYPOINT ["docker-entrypoint.sh"]
-
-EXPOSE 6379
-
-# CMD ["redis-server"]
+RUN mkdir -p "$GOPATH/src" "$GOPATH/bin" && chmod -R 777 "$GOPATH"
+WORKDIR $GOPATH
+COPY run.sh .
+ENTRYPOINT [ "/bin/sh" ]
